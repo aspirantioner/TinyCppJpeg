@@ -11,6 +11,5 @@ int main()
     string dst_file_path = "./test.jpg";
     JpegDecoder jpeg_coder;
     jpeg_coder.Decode(photo_re, 100, dst_file_path);
-
     return 0;
 }

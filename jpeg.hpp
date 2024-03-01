@@ -430,6 +430,151 @@ private:
 class JpegDecoder
 {
 public:
+    bool Decode(PhotoReader &reader, int32_t quality, string &dst_file_path)
+    {
+        /*打开编码目标文件路径*/
+        int file_fd = open(dst_file_path.c_str(), O_WRONLY | O_TRUNC);
+        ERROR_PRINT(file_fd == -1, perror("open jpeg fail!"), return false);
+
+        /*得到YUV各组件数据首地址*/
+        uint8_t *py_buf = reader.data_bufff_;
+        auto y_sum = reader.photo_width_ * reader.photo_height_;
+        uint8_t *pu_buf;
+        uint8_t *pv_buf;
+        SplitData(py_buf, pu_buf, pv_buf, reader.photo_format_, y_sum);
+
+        /*分配带写入的缓冲数据值*/
+        byte_start_p_ = new uint8_t[y_sum];
+        byte_p_ = byte_start_p_;
+        bit_rest_ = 8;
+
+        /*对用户输入的压缩质量规范化为合理值*/
+        QualityScaling(quality);
+
+        /*根据用户输入的压缩质量确定量化表各数值*/
+        SetQuantTable(quality);
+
+        /*确定数据DCT变换后Z字形量化的数值*/
+        SetDctTable();
+
+        /*建立Vli表*/
+        BuildVliTable();
+
+        /*建立YUV的DC,AC哈夫曼表*/
+        BuildHuffTab();
+
+        /*划分宏块以及基本单元数据块*/
+        uint8_t w_scale = 1; // 宽度缩放因子
+        uint8_t h_scale = 1; // 高度缩放因子
+        if (reader.photo_format_ == kYuv420)
+        {
+            w_scale = w_scale << 1;
+            h_scale = h_scale << 1;
+        }
+        else if (reader.photo_format_ == kYuv422)
+        {
+            w_scale = w_scale << 1;
+        }
+        uint16_t mcu_size = DCT_BLOCK_SIZE * w_scale * h_scale;
+        uint32_t mcu_num = y_sum / mcu_size;
+        DivBuff(py_buf, reader.photo_width_, reader.photo_height_, DCT_BLOCK_LEN * w_scale, DCT_BLOCK_LEN * h_scale);
+        if (w_scale != 1 || h_scale != 1)
+        {
+            int offset = 0;
+            for (int i = 0; i < mcu_num; i++)
+            {
+                DivBuff(py_buf + offset, DCT_BLOCK_LEN * w_scale, DCT_BLOCK_LEN * h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
+                offset += mcu_size;
+            }
+        }
+        DivBuff(pu_buf, reader.photo_width_ / w_scale, reader.photo_height_ / h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
+        DivBuff(pv_buf, reader.photo_width_ / w_scale, reader.photo_height_ / h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
+
+        /*按宏块顺序处理数据块*/
+        uint8_t yuv_counter[3] = {1, 1, 1};
+        if (reader.photo_format_ == kYuv420)
+        {
+            yuv_counter[0] = 4;
+        }
+        else if (reader.photo_format_ == kYuv422)
+        {
+            yuv_counter[0] = 2;
+        }
+        ProcessMcu(py_buf, pu_buf, pv_buf, mcu_num, yuv_counter);
+
+        /*带写入的各标志字段以及压缩编码后的数据*/
+        App0 app;
+        QT_8Bit y_qt(Y_QT_FLAG, quality);
+        QT_8Bit uv_qt(UV_QT_FLAG, quality);
+        Sof sof(reader.photo_height_, reader.photo_width_, reader.photo_format_);
+        Dht dcy_dht(kDcYDht);
+        Dht dcuv_dht(kDcUVDht);
+        Dht acy_dht(kAcYDht);
+        Dht acuv_dht(kAcUVDht);
+        string str = "lio's tiny jpeg!";
+        Comment com(std::move(str));
+        Sos sos(reader.photo_format_);
+
+        /*write SOI*/
+        struct iovec iov[16];
+        iov[0].iov_base = &kSoi;
+        iov[0].iov_len = sizeof(kSoi);
+
+        /*write APP0*/
+        iov[1].iov_base = &app;
+        iov[1].iov_len = sizeof(App0);
+
+        /*write Y and UV quality table*/
+        iov[2].iov_base = &y_qt;
+        iov[2].iov_len = sizeof(QT_8Bit);
+        iov[3].iov_base = &uv_qt;
+        iov[3].iov_len = sizeof(QT_8Bit);
+
+        /*write SOF*/
+        iov[4].iov_base = &sof;
+        iov[4].iov_len = sof.comp_num * 3 + 10;
+
+        /*write DC and AC YUV diff-huffman table*/
+        iov[5].iov_base = &dcy_dht;
+        iov[5].iov_len = 5;
+        iov[6].iov_base = dcy_dht.dht_p;
+        iov[6].iov_len = dcy_dht.dht_len;
+
+        iov[7].iov_base = &dcuv_dht;
+        iov[7].iov_len = 5;
+        iov[8].iov_base = dcuv_dht.dht_p;
+        iov[8].iov_len = dcuv_dht.dht_len;
+
+        iov[9].iov_base = &acy_dht;
+        iov[9].iov_len = 5;
+        iov[10].iov_base = acy_dht.dht_p;
+        iov[10].iov_len = acy_dht.dht_len;
+
+        iov[11].iov_base = &acuv_dht;
+        iov[11].iov_len = 5;
+        iov[12].iov_base = acuv_dht.dht_p;
+        iov[12].iov_len = acuv_dht.dht_len;
+
+        /*write SOS*/
+        iov[13].iov_base = &sos;
+        iov[13].iov_len = 8 + 2 * sos.comps_num;
+
+        /*write jpeg code data*/
+        iov[14].iov_base = byte_start_p_;
+        iov[14].iov_len = byte_p_ - byte_start_p_;
+        std::cout << "data len is " << iov[14].iov_len << std::endl;
+
+        /*write EOI*/
+        iov[15].iov_base = &kEoi;
+        iov[15].iov_len = sizeof(kEoi);
+
+        writev(file_fd, iov, 16);
+
+        delete[] byte_start_p_;
+        return true;
+    }
+
+private:
     /*h*w矩阵数据内,从左到右,从上到下按x_len*y_len矩阵划分排列数据*/
     void DivBuff(uint8_t *data_bufff, uint32_t width, uint32_t height, uint32_t x_len, uint32_t y_len)
     {
@@ -723,11 +868,10 @@ public:
     void WriteBitsStream(uint16_t value, uint8_t code_len)
     {
         /*写入的码值bit长度大于字节剩余的bit长度*/
-        while (bit_rest_ <= code_len)
+        while (bit_rest_ < code_len)
         {
-            int gap = code_len - bit_rest_;
-            code_len -= bit_rest_;                 // 剩余写入的bit长度
-            *(byte_p_) += (value >> gap) & 0X00FF; // 写入byte值
+            code_len -= bit_rest_;                      // 剩余写入的bit长度
+            *(byte_p_) += (value >> code_len) & 0X00FF; // 写入byte值
             /*写入0X00防0xFF段标志位字节竞争*/
             if (*byte_p_ == 0xFF)
             {
@@ -905,151 +1049,6 @@ public:
         pv_buf = pu_buf + y_sum; // 默认采用YUV444格式
     }
 
-    bool Decode(PhotoReader &reader, int32_t quality, string &dst_file_path)
-    {
-        /*打开编码目标文件路径*/
-        int file_fd = open(dst_file_path.c_str(), O_WRONLY | O_TRUNC);
-        ERROR_PRINT(file_fd == -1, perror("open jpeg fail!"), return false);
-
-        /*得到YUV各组件数据首地址*/
-        uint8_t *py_buf = reader.data_bufff_;
-        auto y_sum = reader.photo_width_ * reader.photo_height_;
-        uint8_t *pu_buf;
-        uint8_t *pv_buf;
-        SplitData(py_buf, pu_buf, pv_buf, reader.photo_format_, y_sum);
-
-        /*分配带写入的缓冲数据值*/
-        byte_start_p_ = new uint8_t[y_sum];
-        byte_p_ = byte_start_p_;
-        bit_rest_ = 8;
-
-        /*对用户输入的压缩质量规范化为合理值*/
-        QualityScaling(quality);
-
-        /*根据用户输入的压缩质量确定量化表各数值*/
-        SetQuantTable(quality);
-
-        /*确定数据DCT变换后Z字形量化的数值*/
-        SetDctTable();
-
-        /*建立Vli表*/
-        BuildVliTable();
-
-        /*建立YUV的DC,AC哈夫曼表*/
-        BuildHuffTab();
-
-        /*划分宏块以及基本单元数据块*/
-        uint8_t w_scale = 1; // 宽度缩放因子
-        uint8_t h_scale = 1; // 高度缩放因子
-        if (reader.photo_format_ == kYuv420)
-        {
-            w_scale = w_scale << 1;
-            h_scale = h_scale << 1;
-        }
-        else if (reader.photo_format_ == kYuv422)
-        {
-            w_scale = w_scale << 1;
-        }
-        uint16_t mcu_size = DCT_BLOCK_SIZE * w_scale * h_scale;
-        uint32_t mcu_num = y_sum / mcu_size;
-        DivBuff(py_buf, reader.photo_width_, reader.photo_height_, DCT_BLOCK_LEN * w_scale, DCT_BLOCK_LEN * h_scale);
-        if (w_scale != 1 || h_scale != 1)
-        {
-            int offset = 0;
-            for (int i = 0; i < mcu_num; i++)
-            {
-                DivBuff(py_buf + offset, DCT_BLOCK_LEN * w_scale, DCT_BLOCK_LEN * h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
-                offset += mcu_size;
-            }
-        }
-        DivBuff(pu_buf, reader.photo_width_ / w_scale, reader.photo_height_ / h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
-        DivBuff(pv_buf, reader.photo_width_ / w_scale, reader.photo_height_ / h_scale, DCT_BLOCK_LEN, DCT_BLOCK_LEN);
-
-        /*按宏块顺序处理数据块*/
-        uint8_t yuv_counter[3] = {1, 1, 1};
-        if (reader.photo_format_ == kYuv420)
-        {
-            yuv_counter[0] = 4;
-        }
-        else if (reader.photo_format_ == kYuv422)
-        {
-            yuv_counter[0] = 2;
-        }
-        ProcessMcu(py_buf, pu_buf, pv_buf, mcu_num, yuv_counter);
-
-        /*带写入的各标志字段以及压缩编码后的数据*/
-        App0 app;
-        QT_8Bit y_qt(Y_QT_FLAG, quality);
-        QT_8Bit uv_qt(UV_QT_FLAG, quality);
-        Sof sof(reader.photo_height_, reader.photo_width_, reader.photo_format_);
-        Dht dcy_dht(kDcYDht);
-        Dht dcuv_dht(kDcUVDht);
-        Dht acy_dht(kAcYDht);
-        Dht acuv_dht(kAcUVDht);
-        string str = "lio's tiny jpeg!";
-        Comment com(std::move(str));
-        Sos sos(reader.photo_format_);
-
-        /*write SOI*/
-        struct iovec iov[16];
-        iov[0].iov_base = &kSoi;
-        iov[0].iov_len = sizeof(kSoi);
-
-        /*write APP0*/
-        iov[1].iov_base = &app;
-        iov[1].iov_len = sizeof(App0);
-
-        /*write Y and UV quality table*/
-        iov[2].iov_base = &y_qt;
-        iov[2].iov_len = sizeof(QT_8Bit);
-        iov[3].iov_base = &uv_qt;
-        iov[3].iov_len = sizeof(QT_8Bit);
-
-        /*write SOF*/
-        iov[4].iov_base = &sof;
-        iov[4].iov_len = sof.comp_num * 3 + 10;
-
-        /*write DC and AC YUV diff-huffman table*/
-        iov[5].iov_base = &dcy_dht;
-        iov[5].iov_len = 5;
-        iov[6].iov_base = dcy_dht.dht_p;
-        iov[6].iov_len = dcy_dht.dht_len;
-
-        iov[7].iov_base = &dcuv_dht;
-        iov[7].iov_len = 5;
-        iov[8].iov_base = dcuv_dht.dht_p;
-        iov[8].iov_len = dcuv_dht.dht_len;
-
-        iov[9].iov_base = &acy_dht;
-        iov[9].iov_len = 5;
-        iov[10].iov_base = acy_dht.dht_p;
-        iov[10].iov_len = acy_dht.dht_len;
-
-        iov[11].iov_base = &acuv_dht;
-        iov[11].iov_len = 5;
-        iov[12].iov_base = acuv_dht.dht_p;
-        iov[12].iov_len = acuv_dht.dht_len;
-
-        /*write SOS*/
-        iov[13].iov_base = &sos;
-        iov[13].iov_len = 8 + 2 * sos.comps_num;
-
-        /*write jpeg code data*/
-        iov[14].iov_base = byte_start_p_;
-        iov[14].iov_len = byte_p_ - byte_start_p_;
-        std::cout << "data len is " << iov[14].iov_len << std::endl;
-
-        /*write EOI*/
-        iov[15].iov_base = &kEoi;
-        iov[15].iov_len = sizeof(kEoi);
-
-        writev(file_fd, iov, 16);
-
-        delete[] byte_start_p_;
-        return true;
-    }
-
-private:
     uint8_t quality_y_table_[64];
     uint8_t quality_uv_table_[64];
     float dct_y_table_[64];
